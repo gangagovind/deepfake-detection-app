@@ -22,7 +22,7 @@ import torch.nn as nn
 from facenet_pytorch import MTCNN
 from PIL import Image
 
-st.set_page_config(page_title="Signal Forensics Lab", page_icon="◉", layout="wide")
+st.set_page_config(page_title="DeepFake Detection With Compression Resilience", page_icon="◉", layout="wide")
 
 # ─────────────────────────────────────────────────────────────────────────
 # 1. THEME ENGINE
@@ -133,6 +133,17 @@ class DualStreamModel(nn.Module):
         fused = torch.cat([rgb_feat, fft_feat], dim=1)
         return self.classifier(self.dropout(fused))
 
+class SingleStreamModel(nn.Module):
+    def __init__(self, branch_name="rgb_branch"):
+        super().__init__()
+        setattr(self, branch_name, timm.create_model("efficientnet_b0", pretrained=False, num_classes=0))
+        self.dropout = nn.Dropout(p=0.3)
+        self.classifier = nn.Linear(1280, 1)
+        self.branch_name = branch_name
+
+    def forward(self, x):
+        branch = getattr(self, self.branch_name)
+        return self.classifier(self.dropout(branch(x)))
 
 MODELS_DIR = os.environ.get("MODELS_DIR", os.path.dirname(os.path.abspath(__file__)))
 
@@ -149,20 +160,41 @@ DEFAULT_LABEL = "our robustness-trained model"
 def load_model(checkpoint_filename):
     model_path = os.path.join(MODELS_DIR, checkpoint_filename)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DualStreamModel().to(device)
+
+    if "rgb_only" in checkpoint_filename:
+        model = SingleStreamModel(branch_name="rgb_branch").to(device)
+    elif "fft_only" in checkpoint_filename:
+        model = SingleStreamModel(branch_name="fft_branch").to(device)
+    else:
+        model = DualStreamModel().to(device)
+
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     return model, device
-
 
 @st.cache_resource(show_spinner=False)
 def load_mtcnn():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return MTCNN(image_size=224, margin=20, keep_all=False, device=device)
 
-
-def predict_face_probability(model, device, face_rgb_uint8):
+def predict_face_probability(model, device, face_rgb_uint8, is_single_stream=False, stream_type=None):
     img = cv2.resize(face_rgb_uint8, (224, 224))
+
+    if is_single_stream:
+        if stream_type == "rgb_branch":
+            rgb_norm = (img / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
+            tensor = torch.tensor(rgb_norm, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
+            _, fft_vis = fft_preprocess(img)
+            with torch.no_grad():
+                logit = model(tensor)
+            return torch.sigmoid(logit).item(), fft_vis
+        else:
+            fft_img, fft_vis = fft_preprocess(img)
+            tensor = torch.tensor(fft_img, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
+            with torch.no_grad():
+                logit = model(tensor)
+            return torch.sigmoid(logit).item(), fft_vis
+
     rgb_norm = (img / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
     rgb_tensor = torch.tensor(rgb_norm, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
     fft_img, fft_vis = fft_preprocess(img)
@@ -171,7 +203,6 @@ def predict_face_probability(model, device, face_rgb_uint8):
         logit = model(rgb_tensor, fft_tensor)
         prob_real = torch.sigmoid(logit).item()
     return prob_real, fft_vis
-
 
 # ─────────────────────────────────────────────────────────────────────────
 # 3. UPLOAD SAFETY: ffprobe validation, UUID paths, scoped cleanup
@@ -223,15 +254,19 @@ def extract_faces_from_video(video_path, mtcnn, frame_interval=10, max_faces=40)
     return faces, frame_idx, total_read
 
 
-def score_video(video_path, model, device, mtcnn, frame_interval, max_faces):
+def score_video(video_path, model, device, mtcnn, frame_interval, max_faces, checkpoint_filename=""):
     faces, sampled_frames, total_read = extract_faces_from_video(video_path, mtcnn, frame_interval, max_faces)
     if faces is None:
         return {"error": "Could not read this as a video file."}
     if len(faces) == 0:
         return {"error": f"No face detected in {sampled_frames} sampled frames."}
+
+    is_single = "rgb_only" in checkpoint_filename or "fft_only" in checkpoint_filename
+    stream_type = "rgb_branch" if "rgb_only" in checkpoint_filename else ("fft_branch" if "fft_only" in checkpoint_filename else None)
+
     probs, fft_samples = [], []
     for i, face in enumerate(faces):
-        p, fft_vis = predict_face_probability(model, device, face)
+        p, fft_vis = predict_face_probability(model, device, face, is_single_stream=is_single, stream_type=stream_type)
         probs.append(p)
         if i < 3:
             fft_samples.append((face, fft_vis))
@@ -239,7 +274,6 @@ def score_video(video_path, model, device, mtcnn, frame_interval, max_faces):
         "score": float(np.mean(probs)), "probs": probs, "fft_samples": fft_samples,
         "n_faces": len(faces), "sampled_frames": sampled_frames, "total_frames": total_read,
     }
-
 
 # ─────────────────────────────────────────────────────────────────────────
 # 4. COMPRESSION-COMPARISON HELPERS
@@ -283,7 +317,8 @@ def load_results():
 # ─────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("### ◉ Signal Forensics Lab")
+    st.markdown("## DeepFake Detection With Compression Resilience")
+    
     st.markdown('<span class="mono">dual-stream RGB+FFT detector</span>', unsafe_allow_html=True)
     waveform_divider()
     research_mode = st.toggle("Research mode", value=False)
@@ -302,7 +337,7 @@ tab_detect, tab_eval = st.tabs(["◉ Detect", "▤ Evaluation Results"])
 # ─────────────────────────────────────────────────────────────────────────
 
 with tab_detect:
-    st.markdown("## Signal Forensics Lab")
+    st.markdown("## DeepFake Detection With Compression Resilience")
     st.markdown(
         '<span class="mono">Upload a video. We analyze faces in both the pixel domain '
         'and the frequency domain to flag synthetic content.</span>', unsafe_allow_html=True
@@ -333,7 +368,7 @@ with tab_detect:
                 mtcnn = load_mtcnn()
 
             with st.spinner("Extracting faces and analyzing..."):
-                result = score_video(video_path, model, device, mtcnn, frame_interval, max_faces)
+                result = score_video(video_path, model, device, mtcnn, frame_interval, max_faces, checkpoint_filename=checkpoint_path)
 
             if "error" in result:
                 st.error(result["error"])
